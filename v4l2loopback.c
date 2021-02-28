@@ -9,8 +9,7 @@
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * the Free Software /any later version.
  *
  */
 #include <linux/version.h>
@@ -29,6 +28,8 @@
 #include <media/v4l2-device.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-event.h>
+#include <media/videobuf2-core.h>
+#include <media/videobuf2-vmalloc.h>
 
 #include <linux/miscdevice.h>
 #include "v4l2loopback.h"
@@ -344,6 +345,9 @@ struct v4l2_loopback_device {
 
 	wait_queue_head_t read_event;
 	spinlock_t lock;
+	struct mutex mlock;
+	struct vb2_queue *vb2_src_queue;
+	struct vb2_queue *vb2_dst_queue;
 };
 
 /* types of opener shows what opener wants to do with loopback */
@@ -2254,6 +2258,52 @@ static void timeout_timer_clb(unsigned long nr)
 	spin_unlock(&dev->lock);
 }
 
+struct v4l2_loopback_vb2_buffer {
+	struct vb2_buffer *vb2_buffer;
+};
+
+static int v4l2_loopback_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
+                                     unsigned int *num_planes, unsigned int sizes[],
+                                     struct device *alloc_devs[]) {
+    dprintk("queue_setup for loopback running");
+	dprintk("num_buffers: %d", *num_buffers);
+    return -ENOSYS;
+}
+
+int v4l2_loopback_buf_init(struct vb2_buffer *vb) {
+    dprintk("buf_init for loopback running");
+    return -ENOSYS;
+}
+
+int v4l2_loopback_buf_prepare(struct vb2_buffer *vb) {
+    dprintk("buf_prepare for loopback running");
+    return -ENOSYS;
+}
+
+void v4l2_loopback_buf_finish(struct vb2_buffer *vb) {
+    dprintk("buf_finish for loopback running");
+	return;
+}
+
+void v4l2_loopback_buf_cleanup(struct vb2_buffer *vb) {
+    dprintk("buf_cleanup for loopback running");
+	return;
+}
+
+void v4l2_loopback_buf_queue(struct vb2_buffer *vb) {
+    dprintk("buf_queue for loopback running");
+	return;
+}
+
+static const struct vb2_ops v4l2_loopback_vb2_ops = {
+	.queue_setup = v4l2_loopback_queue_setup,
+	.buf_init = v4l2_loopback_buf_init,
+	.buf_prepare = v4l2_loopback_buf_prepare,
+	.buf_finish = v4l2_loopback_buf_finish,
+	.buf_cleanup = v4l2_loopback_buf_cleanup,
+	.buf_queue = v4l2_loopback_buf_queue,
+};
+
 /* init loopback main structure */
 #define DEFAULT_FROM_CONF(confmember, default_condition, default_value)        \
 	((conf) ?                                                              \
@@ -2265,6 +2315,8 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 {
 	struct v4l2_loopback_device *dev;
 	struct v4l2_ctrl_handler *hdl;
+	struct vb2_queue *vb2_src_queue;
+	struct vb2_queue *vb2_dst_queue;
 
 	int err = -ENOMEM;
 
@@ -2443,11 +2495,48 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 	}
 	v4l2loopback_create_sysfs(dev->vdev);
 
+	dprintk("vb2_queue alloc/init");
+
+	vb2_src_queue = kzalloc(sizeof(*vb2_src_queue), GFP_KERNEL);
+	mutex_init(&dev->mlock);
+	vb2_src_queue->type = V4L2_CAP_VIDEO_OUTPUT;
+	vb2_src_queue->io_modes = VB2_MMAP;
+	vb2_src_queue->drv_priv = &dev;
+	vb2_src_queue->buf_struct_size = sizeof(*dev);
+	vb2_src_queue->ops = &v4l2_loopback_vb2_ops;
+	vb2_src_queue->mem_ops = &vb2_vmalloc_memops;
+	vb2_src_queue->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+	vb2_src_queue->lock = &dev->mlock;
+	if (vb2_queue_init(vb2_src_queue) < 0) {
+		goto unregister_video_device;
+	}
+
+	vb2_dst_queue = kzalloc(sizeof(*vb2_dst_queue), GFP_KERNEL);
+	mutex_init(&dev->mlock);
+	vb2_dst_queue->type = V4L2_CAP_VIDEO_CAPTURE;
+	vb2_dst_queue->io_modes = VB2_MMAP;
+	vb2_dst_queue->drv_priv = &dev;
+	vb2_dst_queue->buf_struct_size = sizeof(*dev);
+	vb2_dst_queue->ops = &v4l2_loopback_vb2_ops;
+	vb2_dst_queue->mem_ops = &vb2_vmalloc_memops;
+	vb2_dst_queue->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+	vb2_dst_queue->lock = &dev->mlock;
+	if (vb2_queue_init(vb2_dst_queue) < 0) {
+		goto free_src_queue;
+	}
+
+	dev->vb2_src_queue = vb2_src_queue;
+	dev->vb2_dst_queue = vb2_dst_queue;
+
 	MARK();
 	if (ret_nr)
 		*ret_nr = dev->vdev->num;
 	return 0;
 
+free_src_queue:
+	vb2_queue_release(vb2_src_queue);
+unregister_video_device:
+	video_unregister_device(dev->vdev);
 out_free_device:
 	video_device_release(dev->vdev);
 out_free_handler:
@@ -2463,6 +2552,10 @@ out_free_dev:
 
 static void v4l2_loopback_remove(struct v4l2_loopback_device *dev)
 {
+	dprintk("releasing queues");
+	vb2_queue_release(dev->vb2_src_queue);
+	vb2_queue_release(dev->vb2_dst_queue);
+
 	free_buffers(dev);
 	v4l2loopback_remove_sysfs(dev->vdev);
 	kfree(video_get_drvdata(dev->vdev));
